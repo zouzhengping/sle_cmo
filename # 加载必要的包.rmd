@@ -1,0 +1,200 @@
+# 加载必要的包
+library(DESeq2)
+
+# 读取基因表达矩阵
+countData <- read.table("genes.counts.matrix", header = TRUE, row.names = 1)
+
+# 获取列名
+colNames <- colnames(countData)
+
+# 初始化condition数据框
+condition <- data.frame(sample = colNames, group = NA, cellType = NA)
+
+# 根据列名中的'HC'和'pos'标记分组
+condition$group <- ifelse(grepl("HC", colNames), "normal", ifelse(grepl("pos", colNames), "sle", "neg"))
+
+# 获取列名中下划线最后一个名称作为细胞类型
+condition$cellType <- sapply(strsplit(condition$sample, "_"), function(x) x[length(x)])
+
+# 提取细胞类型为cMo的样本
+condition <- condition[condition$cellType == "cMo", ]
+
+# 将condition数据框转换为DESeqDataSet
+dds <- DESeqDataSetFromMatrix(countData = countData[ , condition$sample],
+                              colData = condition,
+                              design = ~ group)
+
+# 运行DESeq分析
+dds <- DESeq(dds)
+
+# 获取差异表达结果
+res <- results(dds)
+
+# 筛选出 p 值小于 0.05 的基因
+resSig <- res[which(res$padj < 0.05), ]
+
+# 输出筛选后的差异表达结果
+resSigOrdered <- resSig[order(resSig$padj), ]
+
+cMo_deseq_result_sig <- as.data.frame(resSigOrdered)
+write.csv(cMo_deseq_result_sig, file = "cMo_deseq_results_sig.csv")
+
+# 安装并加载必要的包
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+BiocManager::install(c("clusterProfiler", "org.Hs.eg.db"))
+library(clusterProfiler)
+library(org.Hs.eg.db)
+
+# 读取差异基因表达结果
+de_results <- read.csv("cMo_deseq_results_sig.csv", row.names = 1)
+
+#筛选基因
+de_results <- dplyr::filter(de_results, abs(log2FoldChange)>=1 & padj <= 0.01)
+de_genes <- rownames(de_results)
+
+# 提取差异基因名称
+de_genes <- rownames(de_results)
+
+# 进行富集分析
+ego <- enrichGO(gene = de_genes,
+                OrgDb = org.Hs.eg.db,
+                keyType = "ENSEMBL",
+                ont = "BP",
+                pAdjustMethod = "BH",
+                pvalueCutoff = 0.05,
+                qvalueCutoff = 0.2)
+
+# 查看富集结果
+head(ego)
+
+# 绘制富集结果图形
+pdf(file = "cMo_cluster.pdf")
+dotplot(ego)
+dev.off()  
+
+## 多表关联数据整理 
+library(readr)
+cMo_deseq_results <- read_csv("cMo_deseq_results_sig.csv")
+View(cMo_deseq_results)
+colnames(cMo_deseq_results)[1] <- 'id'
+print(head(cMo_deseq_results))
+
+temp <- select(cMo_deseq_results, id,log2FoldChange,pvalue,padj)%>%
+  mutate(direction = if_else(abs(log2FoldChange) < 1 | padj > 0.05, 'ns',
+                             if_else(log2FoldChange >= 1, 'up', 'down')))
+library(tidyverse)
+group_by(temp, direction) %>%
+  summarise(count=n())
+
+## 读取表达矩阵
+library(readr)
+genes_exp <- read_delim("genes.TPM.not_cross_norm",
+                        delim = "\t", escape_double = FALSE,
+                        trim_ws = TRUE)
+colnames(genes_exp)[1] <- "X1"
+
+# 关联表达矩阵
+de_result_counts <- temp %>% 
+  left_join(genes_exp, by = c("id"="X1"))
+
+### 统计差异基因表达情况
+group_by(de_result_counts,direction) %>%
+  summarise(count=n())
+
+### 火山图
+library(EnhancedVolcano)
+pdf(file = 'cMo_deseq_volcano.pdf')
+EnhancedVolcano(
+  de_result_counts,
+  lab = de_result_counts$id,
+  selectLab = c('ENSG00000145016','ENSG00000165168','ENSG00000168397'),
+  x = 'log2FoldChange',
+  y = 'padj')
+dev.off()
+
+
+
+
+### 热图:可以挑选20至30个基因，可以通过火山图挑选关键基因，或者与某些功能相关的基因。
+library(pheatmap)
+pdf(file = 'cMo_top20_heatmap.pdf')
+top_de <- arrange(de_result_counts, desc(abs(log2FoldChange))) %>%
+  slice(1:20) %>%
+  dplyr::select(-log2FoldChange,-padj, -pvalue, - direction) %>%
+  column_to_rownames(var = 'id')
+
+
+# 筛选出列名中含有cMo的样本
+selected_samples <- grep("cMo", colnames(top_de), value = TRUE)
+
+# 在top_de数据框中提取这些样本
+top_de_selected <- top_de[, selected_samples]
+
+# 筛选出列名中不含 'neg' 的样本
+selected_samples <- grep("neg", colnames(top_de_selected), value = TRUE, invert = TRUE)
+
+# 在 top_de_selected 数据框中提取这些样本
+top_de_selected <- top_de_selected[, selected_samples]
+
+# 检查数据中是否存在 NA/NaN/Inf 值
+if(any(is.na(top_de_selected)) || any(is.infinite(top_de_selected))) {
+  # 如果存在 NA/NaN/Inf 值，使用 na.omit() 移除 NA 值
+  top_de_selected <- na.omit(top_de_selected)
+}
+
+# 进行对数转换，加2以避免负无穷大的值
+top_de_selected <- log2(top_de_selected + 2)
+
+# 绘制热图
+pdf(file = 'cMo_top20_heatmap.pdf')
+pheatmap(top_de_selected)
+dev.off() 
+
+#Pathway分析
+
+##ID转换，因为enrichKEGG只能使用ENTREZID
+deg <- bitr(cMo_deseq_results$id,
+            fromType = 'ENSEMBL',
+            toType = 'ENTREZID',
+            OrgDb = org.Hs.eg.db) %>%
+  left_join(cMo_deseq_results, by = c("ENSEMBL"="id")) %>%
+  distinct(ENTREZID, .keep_all = TRUE)
+gene <- deg$ENTREZID
+geneList <- deg$log2FoldChange
+names(geneList) <- deg$ENTREZID
+geneList <- sort(geneList,decreasing = T)
+de_ego_kegg <- enrichKEGG(
+  gene = deg$ENTREZID,
+  organism = 'hsa',
+  keyType = 'kegg',
+  pvalueCutoff = 0.05,
+  qvalueCutoff = 0.05)
+
+#将de_ego_kegg表格中的geneID进行替换
+ekg <- setReadable(de_ego_kegg, OrgDb = org.Hs.eg.db, keyType = 'ENTREZID')
+ekg_df <- as.data.frame(ekg)
+
+#画图
+cnetplot(ekg,
+         foldChange = geneList,circular = T,
+         colorEdge = T)
+
+#画pathway图
+BiocManager::install('pathview')
+library(pathview)
+pathview(gene.data = geneList,
+         pathway.id = 'hsa05169',
+         species = 'hsa',
+         limit = list(gene=max(abs(geneList)), cpd =1))
+#将相关数据存档
+write.table(deg,'cMo_deg_Entriz.csv')
+cMo_deg_symble <- bitr(cMo_deseq_results$id,
+                       fromType = 'ENSEMBL',
+                       toType = 'SYMBOL',
+                       OrgDb = org.Hs.eg.db)%>%
+  left_join(cMo_deseq_results, by = c("ENSEMBL"="id")) %>%
+  distinct(SYMBOL, .keep_all = TRUE)
+write.table(cMo_deg_symble, 'cMo_deg_symble.csv')
+
+
